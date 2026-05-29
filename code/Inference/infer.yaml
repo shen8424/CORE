@@ -1,0 +1,38 @@
+# Inference config. Fill the required paths first; most other values can keep defaults.
+
+model:
+  # Required: original Qwen2.5-VL-3B checkpoint directory.
+  base_model: ./Qwen2.5VL-3B
+
+  # Required: Stage1/2 pipeline output directory. It must contain artifacts.yaml.
+  pipeline_run_dir: /path/to/pipeline_run_dir
+
+  # Required: Stage3 output directory. It must contain checkpoint-* and new_modules.pt.
+  stage3_run_dir: /path/to/stage3_run_dir
+
+swift_infer_args:
+  # Required: test JSONL file.
+  val_dataset: /path/to/test.jsonl
+
+  # Required: output result JSONL path.
+  result_path: ./Outputs/inference/stage3_vllm_results.jsonl
+
+# Defaults. Usually no need to edit.
+env:
+  CUDA_VISIBLE_DEVICES: '0'
+
+runtime_defaults:
+  temp_root: /dev/shm
+  keep_temp_model: false
+
+infer_defaults:
+  model_type: qwen2_5_vl
+  infer_backend: vllm
+  torch_dtype: bfloat16
+  attn_impl: flash_attn
+  max_batch_size: 6
+  max_length: 2048
+  max_new_tokens: 768
+  temperature: 0
+  write_batch_size: 1000
+  system: ''

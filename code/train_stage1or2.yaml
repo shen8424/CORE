@@ -1,0 +1,102 @@
+# 统一训练配置：支持 stage1 / stage2-pre / stage2-post
+# 切换阶段只需修改 run_params.stage
+
+#----------------------------------------------------------------
+# 运行参数
+#----------------------------------------------------------------
+run_params:
+  stage: 'stage2-post'          # 可选: stage1, stage2-pre, stage2-post
+  seed: 42
+
+#----------------------------------------------------------------
+# 阶段专属配置
+#----------------------------------------------------------------
+stages:
+  stage1:
+    # 基础模型，add_new_modules 注入新模块后训练
+    model_id_or_path: './Qwen2.5VL-3B'
+    dataset: ['./data/stage1-5w.jsonl']
+    system_prompt: ''
+    # LoRA 配置
+    lora_rank: 16
+    lora_alpha: 32
+    freeze_llm: False
+    freeze_vit: True
+    freeze_aligner: False
+    # 训练参数
+    learning_rate: 1.0e-5
+    cl_branch_learning_rate: 1.0e-4
+    weight_decay: 0.01
+    cl_branch_weight_decay: 0.0
+    num_train_epochs: 1
+    save_steps: 1000
+    save_total_limit: 1
+    gradient_checkpointing: True
+
+  stage2-pre:
+    # 基础模型 + stage1 的 LoRA checkpoint 和 new_modules
+    # 训练时会先注入 new_modules_pt，再按顺序合并 lora_checkpoints，然后创建 stage2-pre 新 LoRA。
+    model_id_or_path: './Qwen2.5VL-3B'
+    new_modules_pt: './Checkpoints/stage1/<run_id>/new_modules.pt'
+    lora_checkpoints:
+      - './Checkpoints/stage1/<run_id>/checkpoint-*'
+    dataset: ['./data/stage2.jsonl']
+    system_prompt: ''
+    lora_rank: 8
+    lora_alpha: 32
+    freeze_llm: False
+    freeze_vit: True
+    freeze_aligner: False
+    learning_rate: 1.0e-5
+    cl_branch_learning_rate: 1.0e-4
+    weight_decay: 0.01
+    cl_branch_weight_decay: 0.0
+    num_train_epochs: 1
+    save_steps: 1000
+    save_total_limit: 8
+    gradient_checkpointing: True
+
+  stage2-post:
+    # 基础模型 + stage2-pre 的 new_modules + stage1/stage2-pre 的 LoRA checkpoints
+    # 注意：stage2-pre LoRA 是在“base + stage1 LoRA 已合并”的模型上训练的，
+    # 因此 stage2-post 必须先合并 stage1 LoRA，再合并 stage2-pre LoRA。
+    model_id_or_path: './Qwen2.5VL-3B'
+    new_modules_pt: './Checkpoints/stage2-pre/<run_id>/new_modules.pt'
+    lora_checkpoints:
+      - './Checkpoints/stage1/<run_id>/checkpoint-*'
+      - './Checkpoints/stage2-pre/<run_id>/checkpoint-*'
+    dataset: ['./data/stage2-post.jsonl']
+    system_prompt: "To identify fake news, learn to detect conflicts within them. These conflicts include but are not limited to: intra-modal inconsistencies like tampered areas in images that mismatch normal regions; inter-modal conflicts between text and visual content; or discrepancies between news content and established world knowledge."
+    lora_rank: 8
+    lora_alpha: 16
+    freeze_llm: False
+    freeze_vit: True
+    freeze_aligner: False
+    learning_rate: 3.0e-5
+    cl_branch_learning_rate: 1.0e-4
+    stage2_post_cl_weight: 1.0
+    weight_decay: 0.01
+    cl_branch_weight_decay: 0.0
+    num_train_epochs: 1
+    save_steps: 10000
+    save_total_limit: 8
+    gradient_checkpointing: False
+
+#----------------------------------------------------------------
+# 路径参数
+#----------------------------------------------------------------
+path_params:
+  base_dir: "./Outputs"
+
+#----------------------------------------------------------------
+# 数据集通用参数
+#----------------------------------------------------------------
+data_params:
+  max_length: 2048
+  split_dataset_ratio: 0
+  num_proc: 4
+
+#----------------------------------------------------------------
+# DeepSpeed 配置路径
+#----------------------------------------------------------------
+deepspeed_config: './deepspeed_zero2.json'

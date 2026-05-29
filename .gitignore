@@ -1,0 +1,32 @@
+# Model weights - keep folder structure, ignore files
+Qwen2.5VL-3B/*
+!Qwen2.5VL-3B/.gitkeep
+
+# Dataset files - keep folder structure, ignore files
+data/*
+!data/.gitkeep
+Datasets/*
+!Datasets/.gitkeep
+
+# Training outputs
+Outputs/*
+!Outputs/.gitkeep
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+*.egg
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
