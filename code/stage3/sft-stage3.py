@@ -124,7 +124,8 @@ def validate_stage3_inputs(config):
         checkpoint = Path(item.get('path', ''))
         if not checkpoint.exists():
             errors.append(f"{item.get('name', 'LoRA')} checkpoint 不存在: {checkpoint}")
-    if not config['path_params'].get('lora_checkpoints'):
+    allow_no_pipeline = bool(config['path_params'].get('allow_no_pipeline', False))
+    if not config['path_params'].get('lora_checkpoints') and not allow_no_pipeline:
         errors.append('lora_checkpoints 为空：Stage3 必须基于 stage1/stage2 pipeline artifacts 或显式 LoRA checkpoints 继续训练。')
     new_modules = config['path_params'].get('new_modules_checkpoint')
     if new_modules and not Path(new_modules).exists():
@@ -246,6 +247,8 @@ class DetailLossTrainer(Seq2SeqTrainer):
             ('_log_loss_gen', 'loss_gen'),
             ('_log_loss_cl',   'loss_cl'),
             ('_log_loss_box',  'loss_box'),
+            ('_log_loss_conf', 'loss_conf'),
+            ('_log_conf_acc',  'conf_acc'),
         ]:
             val = getattr(inner_model, attr, None)
             if val is not None:
@@ -300,8 +303,15 @@ def main(config_path: str):
     model.stage = stage
 
     # --- 4. 基于 base model 按顺序合并 stage1 -> stage2-pre -> stage2-post 的 LoRA ---
-    model = merge_lora_checkpoints_in_order(model, get_ordered_lora_checkpoints(path_cfg))
+    ordered_loras = get_ordered_lora_checkpoints(path_cfg)
+    if ordered_loras:
+        model = merge_lora_checkpoints_in_order(model, ordered_loras)
+    else:
+        logger.info("未配置 lora_checkpoints（raw backbone 模式）：跳过 stage1/2 LoRA 合并，直接在原始模型上训练 stage3。")
     model.stage = stage
+    # SCC: 下游冲突感知损失权重(仅 stage3-conflict 生效)
+    model.stage3_conflict_weight = float(config.get('run_params', {}).get('conflict_weight', 0.5))
+    logger.info(f"stage={stage}, stage3_conflict_weight={model.stage3_conflict_weight}")
 
     # --- 5. 加载 stage2-post 新模块权重 ---
     new_modules_ckpt = path_cfg.get('new_modules_checkpoint', '')

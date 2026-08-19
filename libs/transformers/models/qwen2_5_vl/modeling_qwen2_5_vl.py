@@ -25,6 +25,7 @@
 # limitations under the License.
 
 import math
+import os
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -373,6 +374,31 @@ class Qwen2_5_VLPreTrainedModel(PreTrainedModel):
                 module.weight.data[module.padding_idx].zero_()
         elif isinstance(module, Qwen2RMSNorm):
             module.weight.data.fill_(1.0)
+        elif isinstance(module, nn.MultiheadAttention):
+            # Auxiliary CL module (vision2text) absent from the pretrained checkpoint.
+            # from_pretrained materializes its params as uninitialized (nan/garbage)
+            # buffers; without an explicit reset they poison the CL loss/gradients.
+            module._reset_parameters()
+
+        # logit_scale / logit_bias are bare nn.Parameters on the CL head and are also
+        # absent from the checkpoint. from_pretrained re-materializes them as garbage
+        # (huge values -> logit_scale.exp()==inf -> nan CL loss), discarding the values
+        # set in __init__. Restore their intended init whenever this module owns them.
+        if hasattr(module, 'logit_scale') and isinstance(getattr(module, 'logit_scale'), nn.Parameter):
+            with torch.no_grad():
+                module.logit_scale.fill_(math.log(10.0))
+        if hasattr(module, 'logit_bias') and isinstance(getattr(module, 'logit_bias'), nn.Parameter):
+            with torch.no_grad():
+                module.logit_bias.zero_()
+        # iter20 辅助头的 logit_scale_aux/logit_bias_aux 同为裸 Parameter, 也须显式初始化(否则nan)。
+        if hasattr(module, 'logit_scale_aux') and isinstance(getattr(module, 'logit_scale_aux'), nn.Parameter):
+            with torch.no_grad():
+                module.logit_scale_aux.fill_(math.log(10.0))
+        if hasattr(module, 'logit_bias_aux') and isinstance(getattr(module, 'logit_bias_aux'), nn.Parameter):
+            with torch.no_grad():
+                module.logit_bias_aux.zero_()
+
+
 
 
 class Qwen2_5_VisionTransformerPretrainedModel(Qwen2_5_VLPreTrainedModel):
@@ -1803,6 +1829,11 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
         self.vision2text = nn.MultiheadAttention(config.hidden_size, config.num_attention_heads, batch_first=True, dropout=0.0)
         self.logit_scale = nn.Parameter(torch.ones([]) * math.log(10.0))
         self.logit_bias = nn.Parameter(torch.zeros(1))
+        # iter20 独立辅助冲突头: 给mismatch(图文语义错配)一条与主vision2text解耦的CL几何,
+        # 使主CL只承载CAC语义冲突+像素篡改(DGM4/MDSM依赖), mismatch的语义信号走辅助头(供MMFB)。
+        self.vision2text_aux = nn.MultiheadAttention(config.hidden_size, config.num_attention_heads, batch_first=True, dropout=0.0)
+        self.logit_scale_aux = nn.Parameter(torch.ones([]) * math.log(10.0))
+        self.logit_bias_aux = nn.Parameter(torch.zeros(1))
         self.model = Qwen2_5_VLModel(config)
         self.lm_head = nn.Linear(config.text_config.hidden_size, config.text_config.vocab_size, bias=False)
         self.stage = None
@@ -1867,6 +1898,7 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
         fake_image_box: Optional[list] = None,
         conflict_src: Optional[list] = None,
         mani_reg: Optional[list] = None,
+        tamper_type: Optional[list] = None,
         bbox: Optional[list] = None,
         image_mask_embed: Optional[list] = None
     ) -> Union[Tuple, Qwen2_5_VLCausalLMOutputWithPast]:
@@ -1969,6 +2001,8 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
                 layer_img_embeds.append(img_tokens)
             stacked = torch.stack(layer_img_embeds, dim=0)  # (12, total_img_tokens, D)
             image_embeds = stacked.mean(dim=0)  # (total_img_tokens, D)
+            # 每样本的图像 token 数(供 SCC 在无 image_grid_thw 时切分视觉序列)
+            self._hooked_img_counts = image_token_mask.sum(dim=1)  # (B,)
 
             # --- Text: last non-padding token from layer 12 (fallback path) → (B, 1, D) ---
             self._hooked_text_cls = self.select_last_nonpad_hidden(outputs.hidden_states[num_layers], attention_mask).unsqueeze(1)
@@ -1981,11 +2015,68 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
         self._log_cl_neg_logit = None
         self._log_logit_scale_exp = None
         self._log_cl_acc = None
+        self._log_loss_conf = None
+        self._log_conf_acc = None
         if labels is not None:
             loss_gen = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size)
             self._log_loss_gen = loss_gen.detach()
             if self.stage is None:
                 loss = loss_gen
+
+        # === SCC (Supervised Conflict Consistency) : stage3 下游冲突感知激活 ===
+        # 把 MBPT/CPT 训好的 vision2text 冲突几何重定向为受下游任务标签直接监督的
+        # 判别式冲突打分器。每样本一致性 logit s = scale*cos(text_cls, vision2text(text_cls, image)).
+        # 监督: orig(Real)->一致 y=1, 篡改(Fake)->冲突 y=0. loss = loss_gen + lambda*BCE(s, y).
+        # auxiliary-only: 推理端不激活(stage=None),生成头已被冲突损失重塑, vLLM 兼容.
+        if self.stage == 'stage3-conflict' and labels is not None:
+            _counts = getattr(self, '_hooked_img_counts', None)
+            if image_embeds is None or self._hooked_text_cls is None or _counts is None:
+                import os as _os
+                if _os.environ.get('SCC_DEBUG'):
+                    print(f"[SCC_DEBUG] precondition fail: image_embeds={image_embeds is not None} "
+                          f"text_cls={self._hooked_text_cls is not None} counts={_counts is not None}", flush=True)
+                loss = loss_gen  # 兜底:SCC 无法计算时退回纯生成损失,绝不返回 None
+            else:
+                text_cls = self._hooked_text_cls.to(image_embeds.device, image_embeds.dtype)  # (B,1,D)
+                # 按每样本图像 token 数把展平的视觉序列切分并 pad 成 (B,L,D)
+                split_sizes = _counts.tolist()
+                img_list = torch.split(image_embeds, split_sizes, dim=0)
+                img_3d = rnn_utils.pad_sequence(img_list, batch_first=True).to(image_embeds.device, image_embeds.dtype)  # (B,L,D)
+                lengths = torch.tensor([c.size(0) for c in img_list], device=image_embeds.device, dtype=torch.long)
+                max_len = img_3d.size(1)
+                img_mask = torch.arange(max_len, device=image_embeds.device).expand(len(img_list), -1) >= lengths.unsqueeze(1)  # True=pad
+                batch_size = img_3d.shape[0]
+                # 逐样本对角:第 i 张图 与 第 i 条文本
+                fused = self.extract_vison(img_3d, text_cls, img_mask)  # (B,1,D)
+                t = text_cls.squeeze(1)
+                v = fused.squeeze(1)
+                t = t / t.float().norm(p=2, dim=-1, keepdim=True).clamp_min(1e-6).to(t.dtype)
+                v = v / v.float().norm(p=2, dim=-1, keepdim=True).clamp_min(1e-6).to(v.dtype)
+                cos = torch.sum(t.float() * v.float(), dim=1)  # (B,)
+                logit_scale = self.logit_scale.to(cos.device, torch.float32).exp().clamp(max=100.0)
+                logit_bias = self.logit_bias.to(cos.device, torch.float32)
+                s = cos * logit_scale + logit_bias  # (B,) 一致性 logit,越大越"一致(Real)"
+                # 从 labels 提取每样本 y: Real(12768)->1, Fake(52317)->0
+                real_tok, fake_tok = 12768, 52317
+                y = torch.full((batch_size,), -1.0, device=cos.device, dtype=torch.float32)
+                for i in range(batch_size):
+                    row = labels[i]
+                    if (row == real_tok).any():
+                        y[i] = 1.0
+                    elif (row == fake_tok).any():
+                        y[i] = 0.0
+                valid = y >= 0
+                if valid.any():
+                    loss_conf = torch.nn.functional.binary_cross_entropy_with_logits(s[valid], y[valid])
+                    conf_weight = float(getattr(self, 'stage3_conflict_weight', 0.5))
+                    self._log_loss_conf = loss_conf.detach()
+                    pred = (s[valid] > 0).float()
+                    self._log_conf_acc = (pred == y[valid]).float().mean().detach()
+                    self._log_logit_scale_exp = logit_scale.detach()
+                    loss = loss_gen + conf_weight * loss_conf.to(loss_gen.device)
+                else:
+                    loss = loss_gen
+
         
 #        if self.stage is not None:
 #            image_embeds = self.extract_masked_states(hidden_states, image_mask_embed).to(hidden_states.device, hidden_states.dtype)
@@ -2134,8 +2225,24 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
                     image_embeds_second = image_embeds[second_srcimg_idxs,:,:]
                     image_mask_second = image_mask[second_srcimg_idxs, :]
                     confl_text_cls_second = confl_text_cls_2[second_srctext_idxs,:,:]
-                    confl_img_cls_second, _ = self.vision2text(query=confl_text_cls_second,key=image_embeds_second,value=image_embeds_second,key_padding_mask=image_mask_second)
-                    confl_img_cls_second = confl_img_cls_second.to(image_embeds.device, image_embeds.dtype)
+                    # iter20 独立辅助头: mismatch样本(其"image"在conflict_src第二位)的图像侧走vision2text_aux,
+                    # 与主vision2text几何解耦; 非mismatch仍走主头。→ mismatch语义冲突不污染主CL几何。
+                    use_aux = getattr(self, 'stage2_aux_head', False) and tamper_type is not None
+                    if use_aux:
+                        aux_flag = torch.tensor([tamper_type[i] == 'mismatch' for i in second_srcimg_idxs],
+                                                device=image_embeds.device, dtype=torch.bool)
+                        confl_img_cls_second = torch.empty_like(confl_text_cls_second)
+                        if (~aux_flag).any():
+                            m = ~aux_flag
+                            o, _ = self.vision2text(query=confl_text_cls_second[m], key=image_embeds_second[m], value=image_embeds_second[m], key_padding_mask=image_mask_second[m])
+                            confl_img_cls_second[m] = o.to(image_embeds.dtype)
+                        if aux_flag.any():
+                            o, _ = self.vision2text_aux(query=confl_text_cls_second[aux_flag], key=image_embeds_second[aux_flag], value=image_embeds_second[aux_flag], key_padding_mask=image_mask_second[aux_flag])
+                            confl_img_cls_second[aux_flag] = o.to(image_embeds.dtype)
+                        confl_img_cls_second = confl_img_cls_second.to(image_embeds.device, image_embeds.dtype)
+                    else:
+                        confl_img_cls_second, _ = self.vision2text(query=confl_text_cls_second,key=image_embeds_second,value=image_embeds_second,key_padding_mask=image_mask_second)
+                        confl_img_cls_second = confl_img_cls_second.to(image_embeds.device, image_embeds.dtype)
                     confl_text_cls_2[second_srctext_idxs, :, :] = confl_img_cls_second
                     del image_embeds_second, image_mask_second, confl_text_cls_second, confl_img_cls_second
 
@@ -2155,7 +2262,19 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
                 m1_diag1 = torch.full_like(logits_per_text, -1)
 
                 loglik = torch.nn.functional.logsigmoid(m1_diag1 * logits_per_text)
-                loss_st2_cl = -loglik.mean()
+                # iter19 CL条件化: 可选把mismatch(图文错配)样本排除出vision2text语义冲突对比。
+                # 诊断证实mismatch的语义冲突几何污染DGM4(换脸,图文语义一致)。排除后CL只训
+                # CAC语义冲突+像素篡改样本(=balrf的CL组成), mismatch的假性只靠loss_gen监督(仍供MMFB)。
+                # 由tamper_type驱动(训练数据标注), 下游测试不喂。tamper_type缺省或未开关时=原.mean()。
+                if getattr(self, 'stage2_cl_exclude_mismatch', False) and tamper_type is not None:
+                    cl_tt = [tt for tt, sub in zip(tamper_type, conflict_src) if sub]
+                    keep = torch.tensor([tt != 'mismatch' for tt in cl_tt], device=loglik.device, dtype=loglik.dtype)
+                    if keep.sum() > 0:
+                        loss_st2_cl = -(loglik * keep).sum() / keep.sum()
+                    else:
+                        loss_st2_cl = -loglik.mean()
+                else:
+                    loss_st2_cl = -loglik.mean()
                 self._log_loss_cl = loss_st2_cl.detach()
 
             ## ============================================= ##
@@ -2180,9 +2299,16 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
 
             assert logits_mani_reg.shape[0] == len(conflict_src)
 
-            conflict_mask = torch.tensor([len(sublist) == 0 for sublist in conflict_src],device=logits_mani_reg.device,dtype=torch.bool)
-
-            mani_reg_m1_diag1 = torch.where(conflict_mask, torch.tensor(1, device=logits_mani_reg.device), torch.tensor(-1, device=logits_mani_reg.device))
+            # iter18 冲突类型条件化: mani_reg像素篡改探针只对真正像素篡改样本(tamper_type=='pixel')
+            # 标"篡改"(-1), 对真图(none)和语义/图文错配冲突(semantic, 图像像素真实)标"真图"(+1)。
+            # → 消除mismatch/CAC语义冲突对像素篡改寄存器的污染(它们的假性只走vision2text语义分支loss_st2_cl)。
+            # tamper_type缺省时回退原逻辑(空conflict_src=+1真图, 非空=-1篡改)。
+            if tamper_type is not None:
+                pixel_mask = torch.tensor([tt == 'pixel' for tt in tamper_type], device=logits_mani_reg.device, dtype=torch.bool)
+                mani_reg_m1_diag1 = torch.where(pixel_mask, torch.tensor(-1, device=logits_mani_reg.device), torch.tensor(1, device=logits_mani_reg.device))
+            else:
+                conflict_mask = torch.tensor([len(sublist) == 0 for sublist in conflict_src],device=logits_mani_reg.device,dtype=torch.bool)
+                mani_reg_m1_diag1 = torch.where(conflict_mask, torch.tensor(1, device=logits_mani_reg.device), torch.tensor(-1, device=logits_mani_reg.device))
 
             loglik_mani_reg = torch.nn.functional.logsigmoid(mani_reg_m1_diag1 * logits_mani_reg)
             loss_st2_box = -loglik_mani_reg.mean()
@@ -2195,6 +2321,11 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
                 # loss = loss_st2_cl.to(loss_gen.device) + loss_st2_box.to(loss_gen.device) + loss_gen
                 stage2_post_cl_weight = getattr(self, 'stage2_post_cl_weight', 1.0)
                 loss = loss_gen + float(stage2_post_cl_weight) * loss_st2_cl.to(loss_gen.device)
+            # 迭代6: 激活被作者搁置的伪造冲突轴(loss_st2_box=mani_reg篡改区域冲突)。
+            # 把"视觉伪造"作为第四类冲突内化进CPT。默认权重0(保持原行为), >0时激活。
+            forgery_w = float(getattr(self, 'stage2_forgery_weight', 0.0))
+            if forgery_w > 0 and loss_st2_box is not None and loss is not None:
+                loss = loss + forgery_w * loss_st2_box.to(loss_gen.device)
             
         if not return_dict:
             output = (logits,) + outputs[1:]

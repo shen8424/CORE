@@ -106,6 +106,12 @@ def normalize_new_module_key(name):
         'vision2text.out_proj.bias',
         'vision_proj.weight',
         'text_proj.weight',
+        'logit_scale_aux',
+        'logit_bias_aux',
+        'vision2text_aux.in_proj_weight',
+        'vision2text_aux.in_proj_bias',
+        'vision2text_aux.out_proj.weight',
+        'vision2text_aux.out_proj.bias',
     }
     return name if name in valid_keys else None
 
@@ -193,7 +199,7 @@ def load_new_modules_into_model(model, checkpoint_path):
 class DetailLossTrainer(Seq2SeqTrainer):
     """记录模型 forward 暴露的各子 loss 到 Trainer 日志。"""
 
-    CL_BRANCH_KEYWORDS = ('vision2text', 'logit_scale', 'logit_bias', 'vision_proj', 'text_proj')
+    CL_BRANCH_KEYWORDS = ('vision2text', 'logit_scale', 'logit_bias', 'vision_proj', 'text_proj', 'vision2text_aux', 'logit_scale_aux', 'logit_bias_aux')
 
     def __init__(self, *args, cl_branch_learning_rate=None, cl_branch_weight_decay=0.0, **kwargs):
         super().__init__(*args, **kwargs)
@@ -376,7 +382,10 @@ def main(config_path: str):
     )
     model.stage = stage
     model.stage2_post_cl_weight = float(stage_cfg.get('stage2_post_cl_weight', 1.0))
-    logger.info(f"Stage2-post CL weight: {model.stage2_post_cl_weight}")
+    model.stage2_forgery_weight = float(stage_cfg.get('stage2_forgery_weight', 0.0))
+    model.stage2_cl_exclude_mismatch = bool(stage_cfg.get('stage2_cl_exclude_mismatch', False))
+    model.stage2_aux_head = bool(stage_cfg.get('stage2_aux_head', False))
+    logger.info(f"Stage2-post CL weight: {model.stage2_post_cl_weight}, forgery weight: {model.stage2_forgery_weight}, cl_exclude_mismatch: {model.stage2_cl_exclude_mismatch}, aux_head: {model.stage2_aux_head}")
 
     if stage in {'stage2-pre', 'stage2-post'}:
         load_new_modules_into_model(model, stage_cfg.get('new_modules_pt', ''))
@@ -384,6 +393,9 @@ def main(config_path: str):
     if stage in {'stage2-pre', 'stage2-post'}:
         model = merge_lora_checkpoints(model, get_lora_checkpoints(stage_cfg), stage)
         model.stage2_post_cl_weight = float(stage_cfg.get('stage2_post_cl_weight', 1.0))
+        model.stage2_forgery_weight = float(stage_cfg.get('stage2_forgery_weight', 0.0))
+        model.stage2_cl_exclude_mismatch = bool(stage_cfg.get('stage2_cl_exclude_mismatch', False))
+        model.stage2_aux_head = bool(stage_cfg.get('stage2_aux_head', False))
 
     template = get_template(
         model.model_meta.template,

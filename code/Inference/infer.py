@@ -193,6 +193,13 @@ def resolve_config(args) -> Dict[str, Any]:
         raw_loras = model_cfg.get('lora_checkpoints') if 'lora_checkpoints' in model_cfg else infer_cfg.get('lora_checkpoints')
         if raw_loras is not None:
             lora_checkpoints = normalize_lora_checkpoints(raw_loras)
+        elif stage3_lora and not any([
+            args.stage1_lora, model_cfg.get('stage1_lora'), infer_cfg.get('stage1_lora'),
+            args.stage2_pre_lora, model_cfg.get('stage2_pre_lora'), infer_cfg.get('stage2_pre_lora'),
+            args.stage2_post_lora, model_cfg.get('stage2_post_lora'), infer_cfg.get('stage2_post_lora'),
+        ]):
+            # raw backbone 模式：只有 stage3 LoRA，无 stage1/2 pipeline
+            lora_checkpoints = [{'name': 'stage3', 'path': stage3_lora}]
         else:
             for name, value in [
                 ('stage1', args.stage1_lora or model_cfg.get('stage1_lora') or infer_cfg.get('stage1_lora')),
